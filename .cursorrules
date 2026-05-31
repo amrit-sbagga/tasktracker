@@ -1,0 +1,256 @@
+# Task Tracker — Cursor Rules (Spring Boot 4, Java 21)
+
+## AI Persona
+
+You are an experienced Senior Java Developer. Follow SOLID, DRY, KISS, and YAGNI. Apply OWASP best practices. Break work into small steps and match existing project conventions before adding new patterns.
+
+## Technology Stack
+
+- **Runtime**: Java 21
+- **Framework**: Spring Boot 4.0.6, Maven (use `./mvnw`)
+- **Base package**: `com.tasktracker`
+- **Dependencies in pom.xml**:
+  - `spring-boot-starter-webmvc` (not the deprecated `spring-boot-starter-web`)
+  - `spring-boot-starter-data-jpa`
+  - `postgresql` driver (42.7.11)
+- **Add when needed** (not in pom yet — add explicitly if required):
+  - `spring-boot-starter-validation` — for `@Valid`, `@NotBlank`, `@Size`, etc.
+  - Do **not** add Lombok, Thymeleaf, or other libraries unless the user asks.
+
+## Spring Boot 4 / Jakarta Rules
+
+- Use **`jakarta.*`** namespaces only — never `javax.*`:
+  - `jakarta.persistence.*` for JPA (`@Entity`, `@Id`, `@Column`, …)
+  - `jakarta.validation.*` for validation (`@NotBlank`, `@Size`, …)
+- Use Boot 4 starter names: `webmvc`, `webmvc-test`, `data-jpa`, `data-jpa-test`.
+- Prefer **constructor injection** for all Spring beans — do not use field `@Autowired`.
+- Let exceptions propagate from controllers to `@RestControllerAdvice` — no try/catch in controllers.
+
+## Project Configuration
+
+- Shared config: `src/main/resources/application.properties` (committed)
+- DB credentials: `src/main/resources/application-local.properties` (gitignored)
+- Template: `application-local.properties.example` (committed)
+- Active profile: `spring.profiles.active=local`
+- Never commit real passwords or put secrets in committed property files.
+
+## Package Structure
+
+```
+com.tasktracker
+├── TasktrackerApplication.java
+├── controller/
+├── service/          # interfaces
+├── service/impl/     # @Service implementations
+├── repository/
+├── entity/
+├── dto/
+└── exception/
+```
+
+## Application Logic Design
+
+1. **Controllers** — HTTP request/response only; no direct database access.
+2. **Services** — business logic and transactions; call repositories.
+3. **Repositories** — data access only; extend `JpaRepository`.
+4. **DTOs** — carry data between controller and service/API boundary.
+5. **Entities** — JPA persistence mapping only; do not expose entities in API responses.
+6. Controllers must not autowire repositories directly.
+
+## Entities
+
+- Annotate with `@Entity`; use plain Java classes with getters/setters (no Lombok unless added to pom).
+- Primary key: `@Id` + `@GeneratedValue(strategy = GenerationType.IDENTITY)`.
+- Relationships: default to `FetchType.LAZY`.
+- Table/column mapping: `@Table`, `@Column` when names differ from defaults.
+- Do **not** put request validation annotations on entities — validate DTOs instead.
+
+Example:
+
+```java
+@Entity
+@Table(name = "tasks")
+public class Task {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false)
+    private String title;
+
+    private boolean completed;
+
+    // getters and setters
+}
+```
+
+## Repository
+
+- Interface extending `JpaRepository<Entity, IdType>`.
+- `@Repository` is optional for Spring Data interfaces.
+- Prefer derived query methods; use `@Query` with JPQL when needed.
+- Use `@EntityGraph(attributePaths = {"relation"})` to avoid N+1 queries.
+- Return DTOs from custom `@Query` methods when joining multiple entities.
+
+## Service
+
+- Define a service **interface** and a `@Service` implementation in `service.impl`.
+- Inject dependencies via constructor.
+- Return DTOs, not entities, to controllers.
+- Use `repository.findById(id).orElseThrow(() -> new ResourceNotFoundException(...))` for missing records.
+- `@Transactional` on write methods; `@Transactional(readOnly = true)` on read-only methods.
+
+Example:
+
+```java
+@Service
+public class TaskServiceImpl implements TaskService {
+
+    private final TaskRepository taskRepository;
+
+    public TaskServiceImpl(TaskRepository taskRepository) {
+        this.taskRepository = taskRepository;
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public TaskResponse getById(Long id) {
+        Task task = taskRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Task not found: " + id));
+        return TaskResponse.from(task);
+    }
+}
+```
+
+## DTOs (Java 21 records)
+
+- Use `record` for request/response DTOs unless there is a strong reason not to.
+- Validate **incoming** DTOs with Jakarta Validation + `@Valid` on controller parameters.
+- Add `spring-boot-starter-validation` to pom.xml when introducing validation.
+- Use compact canonical constructors for simple guard checks when needed.
+
+Example:
+
+```java
+public record CreateTaskRequest(
+        @NotBlank String title
+) {}
+
+public record TaskResponse(Long id, String title, boolean completed) {
+    public static TaskResponse from(Task task) {
+        return new TaskResponse(task.getId(), task.getTitle(), task.isCompleted());
+    }
+}
+```
+
+## RestController
+
+- `@RestController` + class-level `@RequestMapping("/api/...")`.
+- Use specific HTTP method annotations: `@GetMapping`, `@PostMapping`, `@PutMapping`, `@PatchMapping`, `@DeleteMapping`.
+- Constructor injection only.
+- Return `ResponseEntity<ApiResponse<T>>` for consistent API envelopes.
+- Do not catch exceptions in controllers — use `GlobalExceptionHandler`.
+
+Example:
+
+```java
+@RestController
+@RequestMapping("/api/tasks")
+public class TaskController {
+
+    private final TaskService taskService;
+
+    public TaskController(TaskService taskService) {
+        this.taskService = taskService;
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<ApiResponse<TaskResponse>> getById(@PathVariable Long id) {
+        TaskResponse task = taskService.getById(id);
+        return ResponseEntity.ok(ApiResponse.success(task));
+    }
+
+    @PostMapping
+    public ResponseEntity<ApiResponse<TaskResponse>> create(@Valid @RequestBody CreateTaskRequest request) {
+        TaskResponse created = taskService.create(request);
+        return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.success(created));
+    }
+}
+```
+
+## ApiResponse
+
+Use a single consistent envelope. No Lombok — plain Java:
+
+```java
+public class ApiResponse<T> {
+
+    private final String result;
+    private final String message;
+    private final T data;
+
+    private ApiResponse(String result, String message, T data) {
+        this.result = result;
+        this.message = message;
+        this.data = data;
+    }
+
+    public static <T> ApiResponse<T> success(T data) {
+        return new ApiResponse<>("SUCCESS", null, data);
+    }
+
+    public static <T> ApiResponse<T> error(String message) {
+        return new ApiResponse<>("ERROR", message, null);
+    }
+
+    public String getResult() { return result; }
+    public String getMessage() { return message; }
+    public T getData() { return data; }
+}
+```
+
+## Exception Handling
+
+- Custom exceptions: `ResourceNotFoundException`, `BadRequestException`, etc.
+- One `@RestControllerAdvice` class handles all exceptions.
+- Map exceptions to appropriate HTTP status codes.
+
+```java
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<ApiResponse<Void>> handleNotFound(ResourceNotFoundException ex) {
+        return ResponseEntity
+                .status(HttpStatus.NOT_FOUND)
+                .body(ApiResponse.error(ex.getMessage()));
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<ApiResponse<Void>> handleValidation(MethodArgumentNotValidException ex) {
+        String message = ex.getBindingResult().getFieldErrors().stream()
+                .map(error -> error.getField() + ": " + error.getDefaultMessage())
+                .collect(Collectors.joining(", "));
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.error(message));
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ApiResponse<Void>> handleGeneral(Exception ex) {
+        return ResponseEntity
+                .status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(ApiResponse.error("An unexpected error occurred"));
+    }
+}
+```
+
+## General Coding Rules
+
+- Keep changes minimal and focused on the requested task.
+- Match existing naming and package layout.
+- Use `./mvnw` for Maven commands.
+- Do not modify `application-local.properties` — remind the user to edit it locally.
+- Prefer readable code over clever abstractions.
+- Add tests with `spring-boot-starter-webmvc-test` / `spring-boot-starter-data-jpa-test` when implementing features.
